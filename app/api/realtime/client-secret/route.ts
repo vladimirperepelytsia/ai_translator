@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 
 const realtimeModel = process.env.OPENAI_REALTIME_MODEL ?? "gpt-realtime";
-const realtimeVoice = process.env.OPENAI_REALTIME_VOICE ?? "marin";
 
 export const runtime = "nodejs";
 
@@ -32,7 +31,8 @@ export async function POST() {
         type: "realtime",
         model: realtimeModel,
         instructions:
-          "You are a live interpreter for video playback. Listen to spoken English audio and respond only with a natural spoken Ukrainian translation. Keep pace with the source audio, do not explain what you are doing, do not answer side questions, and stay silent during non-speech or when the source is not English.",
+          "Transcribe spoken English from the input audio accurately. Do not generate assistant replies.",
+        output_modalities: ["text"],
         audio: {
           input: {
             transcription: {
@@ -40,16 +40,11 @@ export async function POST() {
               language: "en",
             },
             turn_detection: {
-              type: "server_vad",
-              threshold: 0.45,
-              prefix_padding_ms: 250,
-              silence_duration_ms: 500,
-              create_response: true,
-              interrupt_response: true,
+              type: "semantic_vad",
+              eagerness: "low",
+              create_response: false,
+              interrupt_response: false,
             },
-          },
-          output: {
-            voice: realtimeVoice,
           },
         },
       },

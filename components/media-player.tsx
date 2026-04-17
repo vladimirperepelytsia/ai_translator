@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   formatSeconds,
   getPTLiveProxyUrl,
@@ -9,6 +9,41 @@ import {
 } from "@/lib/media";
 
 type TranslationState = "idle" | "starting" | "live" | "error";
+
+type TranslatedClip = {
+  translatedText: string;
+  audioBase64: string;
+  mimeType: string;
+};
+
+const translationSessionUpdate = {
+  type: "session.update",
+  session: {
+    instructions:
+      "Transcribe spoken English from the input audio accurately. Do not generate assistant replies.",
+    output_modalities: ["text"],
+    audio: {
+      input: {
+        turn_detection: {
+          type: "semantic_vad",
+          eagerness: "low",
+          create_response: false,
+          interrupt_response: false,
+        },
+        transcription: {
+          model: "gpt-4o-mini-transcribe",
+          language: "en",
+        },
+      },
+    },
+  },
+} as const;
+
+function base64ToBlob(base64: string, mimeType: string) {
+  const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+
+  return new Blob([bytes], { type: mimeType });
+}
 
 function Detail({
   label,
@@ -38,11 +73,56 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
   const originalGainRef = useRef<GainNode | null>(null);
   const captureDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const translationQueueRef = useRef<string[]>([]);
+  const playbackQueueRef = useRef<TranslatedClip[]>([]);
+  const isTranslatingRef = useRef(false);
+  const currentPlaybackUrlRef = useRef<string | null>(null);
+  const sessionVersionRef = useRef(0);
   const [translationState, setTranslationState] = useState<TranslationState>("idle");
   const [statusMessage, setStatusMessage] = useState(
     "Ready to start Ukrainian voice translation.",
   );
   const [transcriptHistory, setTranscriptHistory] = useState<string[]>([]);
+  const [translatedHistory, setTranslatedHistory] = useState<string[]>([]);
+  const [pendingTranslations, setPendingTranslations] = useState(0);
+
+  const clearPlaybackAudio = useCallback(() => {
+    if (translatedAudioRef.current) {
+      translatedAudioRef.current.pause();
+      translatedAudioRef.current.srcObject = null;
+      translatedAudioRef.current.removeAttribute("src");
+      translatedAudioRef.current.load();
+      translatedAudioRef.current.onended = null;
+    }
+
+    if (currentPlaybackUrlRef.current) {
+      URL.revokeObjectURL(currentPlaybackUrlRef.current);
+      currentPlaybackUrlRef.current = null;
+    }
+  }, []);
+
+  const stopTranslation = useCallback(() => {
+    sessionVersionRef.current += 1;
+
+    dataChannelRef.current?.close();
+    dataChannelRef.current = null;
+
+    peerConnectionRef.current?.close();
+    peerConnectionRef.current = null;
+
+    clearPlaybackAudio();
+
+    if (originalGainRef.current) {
+      originalGainRef.current.gain.value = 1;
+    }
+
+    translationQueueRef.current = [];
+    playbackQueueRef.current = [];
+    isTranslatingRef.current = false;
+    setPendingTranslations(0);
+    setTranslationState("idle");
+    setStatusMessage("Translation stopped.");
+  }, [clearPlaybackAudio]);
 
   useEffect(() => {
     return () => {
@@ -50,27 +130,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
       void audioContextRef.current?.close();
       audioContextRef.current = null;
     };
-  }, []);
-
-  function stopTranslation() {
-    dataChannelRef.current?.close();
-    dataChannelRef.current = null;
-
-    peerConnectionRef.current?.close();
-    peerConnectionRef.current = null;
-
-    if (translatedAudioRef.current) {
-      translatedAudioRef.current.pause();
-      translatedAudioRef.current.srcObject = null;
-    }
-
-    if (originalGainRef.current) {
-      originalGainRef.current.gain.value = 1;
-    }
-
-    setTranslationState("idle");
-    setStatusMessage("Translation stopped.");
-  }
+  }, [stopTranslation]);
 
   async function ensureAudioGraph() {
     const video = videoRef.current;
@@ -112,14 +172,119 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
     return captureDestinationRef.current.stream;
   }
 
+  async function playNextClip() {
+    const translatedAudio = translatedAudioRef.current;
+    const nextClip = playbackQueueRef.current.shift();
+
+    if (!translatedAudio || !nextClip) {
+      if (translationState === "live") {
+        setStatusMessage("Listening for the next English phrase...");
+      }
+      return;
+    }
+
+    clearPlaybackAudio();
+
+    const clipUrl = URL.createObjectURL(base64ToBlob(nextClip.audioBase64, nextClip.mimeType));
+    currentPlaybackUrlRef.current = clipUrl;
+    translatedAudio.src = clipUrl;
+    translatedAudio.onended = () => {
+      void playNextClip();
+    };
+
+    setTranslatedHistory((currentHistory) => [...currentHistory, nextClip.translatedText]);
+    setStatusMessage("Playing the full Ukrainian phrase...");
+
+    try {
+      await translatedAudio.play();
+    } catch {
+      setStatusMessage("Translated audio is ready. Press play if the browser kept audio muted.");
+    }
+  }
+
+  async function processTranslationQueue(sessionVersion: number) {
+    if (isTranslatingRef.current) {
+      return;
+    }
+
+    isTranslatingRef.current = true;
+
+    while (translationQueueRef.current.length > 0 && sessionVersionRef.current === sessionVersion) {
+      const englishPhrase = translationQueueRef.current.shift();
+
+      if (!englishPhrase) {
+        continue;
+      }
+
+      setPendingTranslations(translationQueueRef.current.length);
+      setStatusMessage("Translating the next English phrase into Ukrainian...");
+
+      try {
+        const response = await fetch("/api/translate-speech", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            text: englishPhrase,
+          }),
+        });
+        const payload = (await response.json()) as {
+          error?: string;
+          translatedText?: string;
+          audioBase64?: string;
+          mimeType?: string;
+        };
+
+        if (!response.ok || !payload.audioBase64 || !payload.translatedText || !payload.mimeType) {
+          throw new Error(payload.error ?? "Could not translate and synthesize the phrase.");
+        }
+
+        if (sessionVersionRef.current !== sessionVersion) {
+          break;
+        }
+
+        playbackQueueRef.current.push({
+          translatedText: payload.translatedText,
+          audioBase64: payload.audioBase64,
+          mimeType: payload.mimeType,
+        });
+
+        if (translatedAudioRef.current?.paused ?? true) {
+          await playNextClip();
+        }
+      } catch (error) {
+        setTranslationState("error");
+        setStatusMessage(
+          error instanceof Error
+            ? error.message
+            : "Something went wrong while translating the phrase.",
+        );
+        break;
+      }
+    }
+
+    isTranslatingRef.current = false;
+    setPendingTranslations(translationQueueRef.current.length);
+  }
+
   async function startTranslation() {
     if (translationState === "starting" || translationState === "live") {
       return;
     }
 
     try {
+      sessionVersionRef.current += 1;
+      const currentSessionVersion = sessionVersionRef.current;
+
       setTranslationState("starting");
       setStatusMessage("Preparing browser audio capture...");
+      setTranscriptHistory([]);
+      setTranslatedHistory([]);
+      setPendingTranslations(0);
+      translationQueueRef.current = [];
+      playbackQueueRef.current = [];
+      clearPlaybackAudio();
 
       const captureStream = await ensureAudioGraph();
       const audioTrack = captureStream.getAudioTracks()[0];
@@ -128,7 +293,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
         throw new Error("Could not capture the PT Live video audio track.");
       }
 
-      setStatusMessage("Requesting an OpenAI Realtime session...");
+      setStatusMessage("Requesting an OpenAI Realtime transcription session...");
       const tokenResponse = await fetch("/api/realtime/client-secret", {
         method: "POST",
       });
@@ -144,23 +309,12 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
       const peerConnection = new RTCPeerConnection();
       peerConnectionRef.current = peerConnection;
 
-      peerConnection.ontrack = (event) => {
-        if (!translatedAudioRef.current) {
-          return;
-        }
-
-        translatedAudioRef.current.srcObject = event.streams[0];
-        void translatedAudioRef.current.play().catch(() => {
-          setStatusMessage("Translation connected. Press play if the translated audio stays muted.");
-        });
-      };
-
       peerConnection.onconnectionstatechange = () => {
         const state = peerConnection.connectionState;
 
         if (state === "connected") {
           setTranslationState("live");
-          setStatusMessage("Live Ukrainian voice translation is active.");
+          setStatusMessage("Listening to English audio and queuing full Ukrainian phrases.");
           if (originalGainRef.current) {
             originalGainRef.current.gain.value = 0;
           }
@@ -172,18 +326,26 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
       const dataChannel = peerConnection.createDataChannel("oai-events");
       dataChannelRef.current = dataChannel;
 
+      dataChannel.addEventListener("open", () => {
+        dataChannel.send(JSON.stringify(translationSessionUpdate));
+      });
+
       dataChannel.addEventListener("message", (event) => {
         try {
           const payload = JSON.parse(event.data) as {
             type?: string;
             transcript?: string;
           };
+          const transcript = payload.transcript;
 
           if (
             payload.type === "conversation.item.input_audio_transcription.completed" &&
-            typeof payload.transcript === "string"
+            typeof transcript === "string"
           ) {
-            setTranscriptHistory((currentHistory) => [...currentHistory, payload.transcript]);
+            setTranscriptHistory((currentHistory) => [...currentHistory, transcript]);
+            translationQueueRef.current.push(transcript);
+            setPendingTranslations(translationQueueRef.current.length);
+            void processTranslationQueue(currentSessionVersion);
           }
         } catch {
           // Ignore malformed realtime events.
@@ -218,7 +380,9 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
         sdp: await realtimeResponse.text(),
       });
 
-      setStatusMessage("Connected. Start or resume the video to hear Ukrainian translation.");
+      setStatusMessage(
+        "Connected. Start or resume the video. English phrases will be translated and spoken in order.",
+      );
     } catch (error) {
       stopTranslation();
       setTranslationState("error");
@@ -273,9 +437,14 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
         <div className="mt-4 rounded-2xl border border-white/10 bg-black/20 p-4 text-sm text-white/70">
           <p>{statusMessage}</p>
           <p className="mt-2 text-white/50">
-            While translation is active, the original English audio is muted and replaced with an
-            AI-generated Ukrainian voice.
+            While translation is active, the original English audio is muted. Each detected English
+            phrase is translated, synthesized, and played to completion in Ukrainian.
           </p>
+          {pendingTranslations > 0 ? (
+            <p className="mt-2 text-cyan-200/80">
+              Pending phrases in queue: {pendingTranslations}
+            </p>
+          ) : null}
         </div>
 
         {transcriptHistory.length > 0 ? (
@@ -285,6 +454,24 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
             </p>
             <div className="mt-3 max-h-64 space-y-3 overflow-y-auto pr-2">
               {transcriptHistory.map((phrase, index) => (
+                <div
+                  key={`${index}-${phrase}`}
+                  className="rounded-xl border border-white/8 bg-black/20 px-3 py-2"
+                >
+                  <p className="text-sm text-white/85">{phrase}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {translatedHistory.length > 0 ? (
+          <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4">
+            <p className="text-xs uppercase tracking-[0.2em] text-emerald-300/80">
+              Spoken Ukrainian Translation
+            </p>
+            <div className="mt-3 max-h-64 space-y-3 overflow-y-auto pr-2">
+              {translatedHistory.map((phrase, index) => (
                 <div
                   key={`${index}-${phrase}`}
                   className="rounded-xl border border-white/8 bg-black/20 px-3 py-2"
