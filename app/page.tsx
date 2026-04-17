@@ -6,7 +6,8 @@ type PageProps = {
   }>;
 };
 
-type VideoDetails = {
+type PTLiveVideoDetails = {
+  kind: "ptlive";
   shareUrl: string;
   videoUrl: string;
   title: string;
@@ -17,13 +18,34 @@ type VideoDetails = {
   dateTo?: string;
 };
 
-const ALLOWED_HOSTS = new Set([
+type YouTubeVideoDetails = {
+  kind: "youtube";
+  shareUrl: string;
+  embedUrl: string;
+  title: string;
+  videoId: string;
+  startAt?: number;
+};
+
+type MediaDetails = PTLiveVideoDetails | YouTubeVideoDetails;
+
+const PTLIVE_HOSTS = new Set([
   "recordings.ptlive-sandbox.video",
   "recordings.ptlive.video",
 ]);
 
+const YOUTUBE_HOSTS = new Set([
+  "youtube.com",
+  "youtu.be",
+  "youtube-nocookie.com",
+]);
+
 function getSingleValue(value: SearchParamValue) {
   return Array.isArray(value) ? value[0] : value;
+}
+
+function normalizeHostname(hostname: string) {
+  return hostname.replace(/^(?:www\.|m\.)/, "");
 }
 
 function decodeHtml(value: string) {
@@ -61,7 +83,7 @@ function getMetadataValue(html: string, label: string) {
   );
 }
 
-function validateShareUrl(rawUrl: string) {
+function parseSupportedUrl(rawUrl: string) {
   let parsedUrl: URL;
 
   try {
@@ -74,17 +96,19 @@ function validateShareUrl(rawUrl: string) {
     throw new Error("Only HTTP and HTTPS URLs are supported.");
   }
 
-  if (!ALLOWED_HOSTS.has(parsedUrl.hostname) || !parsedUrl.pathname.startsWith("/share/")) {
+  return parsedUrl;
+}
+
+async function extractPTLiveDetails(parsedUrl: URL): Promise<PTLiveVideoDetails> {
+  const hostname = normalizeHostname(parsedUrl.hostname);
+
+  if (!PTLIVE_HOSTS.has(hostname) || !parsedUrl.pathname.startsWith("/share/")) {
     throw new Error(
       "Use a PT Live recording share link from recordings.ptlive-sandbox.video or recordings.ptlive.video.",
     );
   }
 
-  return parsedUrl.toString();
-}
-
-async function extractVideoDetails(rawUrl: string): Promise<VideoDetails> {
-  const shareUrl = validateShareUrl(rawUrl);
+  const shareUrl = parsedUrl.toString();
   const response = await fetch(shareUrl, { cache: "no-store" });
 
   if (!response.ok) {
@@ -92,13 +116,14 @@ async function extractVideoDetails(rawUrl: string): Promise<VideoDetails> {
   }
 
   const html = await response.text();
-  const videoUrl = matchValue(html, /<source\s+src="([^"]+)"\s+type="video\/mp4"/i);
+  const videoUrl = matchValue(html, /<source[^>]+src="([^"]+)"[^>]+type="video\/mp4"/i);
 
   if (!videoUrl) {
     throw new Error("No MP4 source was found on the shared recording page.");
   }
 
   return {
+    kind: "ptlive",
     shareUrl,
     videoUrl,
     posterUrl: matchValue(html, /<video[^>]*poster="([^"]*)"/i),
@@ -113,6 +138,123 @@ async function extractVideoDetails(rawUrl: string): Promise<VideoDetails> {
     dateFrom: getMetadataValue(html, "Date From"),
     dateTo: getMetadataValue(html, "Date To"),
   };
+}
+
+function parseYouTubeTimecode(value: string | null) {
+  if (!value) {
+    return undefined;
+  }
+
+  if (/^\d+$/.test(value)) {
+    return Number(value);
+  }
+
+  const match = value.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i);
+
+  if (!match) {
+    return undefined;
+  }
+
+  const hours = Number(match[1] ?? 0);
+  const minutes = Number(match[2] ?? 0);
+  const seconds = Number(match[3] ?? 0);
+  const total = hours * 3600 + minutes * 60 + seconds;
+
+  return total > 0 ? total : undefined;
+}
+
+function formatSeconds(totalSeconds: number) {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function isValidYouTubeId(value: string | null | undefined): value is string {
+  return Boolean(value && /^[A-Za-z0-9_-]{11}$/.test(value));
+}
+
+function getYouTubeVideoId(parsedUrl: URL) {
+  const hostname = normalizeHostname(parsedUrl.hostname);
+  const pathSegments = parsedUrl.pathname.split("/").filter(Boolean);
+
+  if (hostname === "youtu.be") {
+    return pathSegments[0];
+  }
+
+  if (hostname !== "youtube.com" && hostname !== "youtube-nocookie.com") {
+    return undefined;
+  }
+
+  if (parsedUrl.pathname === "/watch") {
+    return parsedUrl.searchParams.get("v") ?? undefined;
+  }
+
+  const [firstSegment, secondSegment] = pathSegments;
+
+  if (["embed", "shorts", "live", "v"].includes(firstSegment ?? "")) {
+    return secondSegment;
+  }
+
+  return undefined;
+}
+
+function extractYouTubeDetails(parsedUrl: URL): YouTubeVideoDetails {
+  const hostname = normalizeHostname(parsedUrl.hostname);
+
+  if (!YOUTUBE_HOSTS.has(hostname)) {
+    throw new Error("Use a valid YouTube URL.");
+  }
+
+  const videoId = getYouTubeVideoId(parsedUrl);
+
+  if (!isValidYouTubeId(videoId)) {
+    throw new Error("Could not determine the YouTube video ID from that URL.");
+  }
+
+  const startAt =
+    parseYouTubeTimecode(parsedUrl.searchParams.get("start")) ??
+    parseYouTubeTimecode(parsedUrl.searchParams.get("t")) ??
+    parseYouTubeTimecode(parsedUrl.hash.startsWith("#t=") ? parsedUrl.hash.slice(3) : null);
+  const embedParams = new URLSearchParams({
+    rel: "0",
+    modestbranding: "1",
+  });
+
+  if (startAt) {
+    embedParams.set("start", String(startAt));
+  }
+
+  return {
+    kind: "youtube",
+    shareUrl: parsedUrl.toString(),
+    embedUrl: `https://www.youtube-nocookie.com/embed/${videoId}?${embedParams.toString()}`,
+    title: "YouTube Video",
+    videoId,
+    startAt,
+  };
+}
+
+async function extractMediaDetails(rawUrl: string): Promise<MediaDetails> {
+  const parsedUrl = parseSupportedUrl(rawUrl);
+  const hostname = normalizeHostname(parsedUrl.hostname);
+
+  if (PTLIVE_HOSTS.has(hostname)) {
+    return extractPTLiveDetails(parsedUrl);
+  }
+
+  if (YOUTUBE_HOSTS.has(hostname)) {
+    return extractYouTubeDetails(parsedUrl);
+  }
+
+  throw new Error(
+    "Use either a PT Live share link or a YouTube URL.",
+  );
 }
 
 function Detail({
@@ -137,17 +279,17 @@ function Detail({
 export default async function Home({ searchParams }: PageProps) {
   const shareUrl = getSingleValue((await searchParams).url)?.trim() ?? "";
 
-  let video: VideoDetails | null = null;
+  let media: MediaDetails | null = null;
   let error: string | null = null;
 
   if (shareUrl) {
     try {
-      video = await extractVideoDetails(shareUrl);
+      media = await extractMediaDetails(shareUrl);
     } catch (caughtError) {
       error =
         caughtError instanceof Error
           ? caughtError.message
-          : "Something went wrong while extracting the video.";
+          : "Something went wrong while loading the media.";
     }
   }
 
@@ -161,17 +303,19 @@ export default async function Home({ searchParams }: PageProps) {
                 Video Extractor
               </p>
               <h1 className="mt-4 max-w-2xl text-4xl font-semibold tracking-tight text-white sm:text-5xl">
-                Paste a PT Live share link and play the extracted recording directly.
+                Paste a PT Live or YouTube link and play the result directly.
               </h1>
               <p className="mt-4 max-w-2xl text-base leading-7 text-white/70">
-                Submit a shared recording URL like
+                Submit a PT Live shared recording URL to extract its MP4 source, or paste a YouTube
+                URL to open it in an embedded player.
+                {" "}
+                Supported examples:
                 {" "}
                 <span className="text-white/90">
-                  https://recordings.ptlive-sandbox.video/share/...
+                  https://recordings.ptlive-sandbox.video/share/... or
+                  {" "}
+                  https://www.youtube.com/watch?v=...
                 </span>
-                {" "}
-                and the page will fetch the share document, extract the MP4 source, and render it in
-                a native player.
               </p>
             </div>
 
@@ -179,13 +323,13 @@ export default async function Home({ searchParams }: PageProps) {
               <form action="" className="space-y-4">
                 <label className="block">
                   <span className="mb-2 block text-sm font-medium text-white/80">
-                    Recording share URL
+                    Share or video URL
                   </span>
                   <input
                     type="url"
                     name="url"
                     defaultValue={shareUrl}
-                    placeholder="https://recordings.ptlive-sandbox.video/share/..."
+                    placeholder="https://recordings.ptlive-sandbox.video/share/... or https://youtu.be/..."
                     className="w-full rounded-2xl border border-white/15 bg-black/20 px-4 py-3 text-sm text-white outline-none ring-0 placeholder:text-white/35 focus:border-cyan-300/60"
                     autoComplete="off"
                     spellCheck={false}
@@ -201,8 +345,8 @@ export default async function Home({ searchParams }: PageProps) {
               </form>
 
               <div className="mt-6 rounded-2xl border border-white/10 bg-black/20 p-4 text-sm text-white/60">
-                The fetch runs on the server, which avoids browser CORS issues when reading the share
-                page HTML.
+                PT Live links are fetched on the server to avoid CORS issues while reading the share
+                page HTML. YouTube links are converted into a privacy-enhanced embed URL.
               </div>
             </div>
           </div>
@@ -215,33 +359,61 @@ export default async function Home({ searchParams }: PageProps) {
           </section>
         ) : null}
 
-        {video ? (
+        {media ? (
           <section className="overflow-hidden rounded-[2rem] border border-white/10 bg-slate-950/80 shadow-2xl shadow-black/40">
             <div className="border-b border-white/10 px-6 py-5 sm:px-8">
-              <p className="text-xs uppercase tracking-[0.25em] text-cyan-300/80">Loaded Video</p>
-              <h2 className="mt-2 text-2xl font-semibold text-white">{video.title}</h2>
-              <p className="mt-2 text-sm text-white/60">{video.shareUrl}</p>
+              <p className="text-xs uppercase tracking-[0.25em] text-cyan-300/80">Loaded Media</p>
+              <h2 className="mt-2 text-2xl font-semibold text-white">{media.title}</h2>
+              <p className="mt-2 text-sm text-white/60">{media.shareUrl}</p>
             </div>
 
             <div className="aspect-video bg-black">
-              <video
-                key={video.videoUrl}
-                controls
-                playsInline
-                preload="metadata"
-                poster={video.posterUrl}
-                className="h-full w-full"
-              >
-                <source src={video.videoUrl} type="video/mp4" />
-                Your browser does not support the video tag.
-              </video>
+              {media.kind === "ptlive" ? (
+                <video
+                  key={media.videoUrl}
+                  controls
+                  playsInline
+                  preload="metadata"
+                  poster={media.posterUrl}
+                  className="h-full w-full"
+                >
+                  <source src={media.videoUrl} type="video/mp4" />
+                  Your browser does not support the video tag.
+                </video>
+              ) : (
+                <iframe
+                  key={media.embedUrl}
+                  src={media.embedUrl}
+                  title={media.title}
+                  className="h-full w-full"
+                  referrerPolicy="strict-origin-when-cross-origin"
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                  allowFullScreen
+                />
+              )}
             </div>
 
             <div className="grid gap-4 px-6 py-6 sm:grid-cols-2 xl:grid-cols-4 sm:px-8">
-              <Detail label="Created" value={video.createdAt} />
-              <Detail label="Date From" value={video.dateFrom} />
-              <Detail label="Date To" value={video.dateTo} />
-              <Detail label="Expires On" value={video.expiresAt} />
+              <Detail
+                label="Platform"
+                value={media.kind === "ptlive" ? "PT Live" : "YouTube"}
+              />
+              {media.kind === "ptlive" ? (
+                <>
+                  <Detail label="Created" value={media.createdAt} />
+                  <Detail label="Date From" value={media.dateFrom} />
+                  <Detail label="Date To" value={media.dateTo} />
+                  <Detail label="Expires On" value={media.expiresAt} />
+                </>
+              ) : (
+                <>
+                  <Detail label="Video ID" value={media.videoId} />
+                  <Detail
+                    label="Start At"
+                    value={media.startAt ? formatSeconds(media.startAt) : undefined}
+                  />
+                </>
+              )}
             </div>
           </section>
         ) : null}

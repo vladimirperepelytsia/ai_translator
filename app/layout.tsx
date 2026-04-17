@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "PT Live Video Extractor",
-  description: "Paste a PT Live recording share link and play the extracted MP4.",
+  title: "PT Live & YouTube Player",
+  description: "Paste a PT Live or YouTube URL and play it directly.",
 };
 
 export default function RootLayout({
