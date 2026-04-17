@@ -42,7 +42,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
   const [statusMessage, setStatusMessage] = useState(
     "Ready to start Ukrainian voice translation.",
   );
-  const [lastTranscript, setLastTranscript] = useState<string | null>(null);
+  const [transcriptHistory, setTranscriptHistory] = useState<string[]>([]);
 
   useEffect(() => {
     return () => {
@@ -120,7 +120,6 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
     try {
       setTranslationState("starting");
       setStatusMessage("Preparing browser audio capture...");
-      setLastTranscript(null);
 
       const captureStream = await ensureAudioGraph();
       const audioTrack = captureStream.getAudioTracks()[0];
@@ -184,7 +183,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
             payload.type === "conversation.item.input_audio_transcription.completed" &&
             typeof payload.transcript === "string"
           ) {
-            setLastTranscript(payload.transcript);
+            setTranscriptHistory((currentHistory) => [...currentHistory, payload.transcript]);
           }
         } catch {
           // Ignore malformed realtime events.
@@ -279,12 +278,21 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
           </p>
         </div>
 
-        {lastTranscript ? (
+        {transcriptHistory.length > 0 ? (
           <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4">
             <p className="text-xs uppercase tracking-[0.2em] text-cyan-300/80">
               Latest English Speech
             </p>
-            <p className="mt-3 text-sm text-white/85">{lastTranscript}</p>
+            <div className="mt-3 max-h-64 space-y-3 overflow-y-auto pr-2">
+              {transcriptHistory.map((phrase, index) => (
+                <div
+                  key={`${index}-${phrase}`}
+                  className="rounded-xl border border-white/8 bg-black/20 px-3 py-2"
+                >
+                  <p className="text-sm text-white/85">{phrase}</p>
+                </div>
+              ))}
+            </div>
           </div>
         ) : null}
 
