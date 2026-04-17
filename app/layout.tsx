@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "PT Live & YouTube Player",
-  description: "Paste a PT Live or YouTube URL and play it directly.",
+  description: "Paste a PT Live or YouTube URL and play it with optional Ukrainian live dubbing.",
 };
 
 export default function RootLayout({
