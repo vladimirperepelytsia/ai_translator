@@ -1,10 +1,66 @@
 import { NextResponse } from "next/server";
+import {
+  isStaticAuthConfigured,
+  isStaticAuthRequestAuthorized,
+  shouldBypassStaticAuth,
+} from "@/lib/static-auth";
 
 const realtimeModel = process.env.OPENAI_REALTIME_MODEL ?? "gpt-realtime";
+const realtimeVoice =
+  process.env.OPENAI_REALTIME_VOICE ?? process.env.OPENAI_TTS_VOICE ?? "marin";
 
 export const runtime = "nodejs";
 
-export async function POST() {
+type RealtimeMode = "transcription" | "translation";
+
+function getSessionConfig(mode: RealtimeMode) {
+  if (mode === "translation") {
+    return {
+      type: "realtime",
+      model: realtimeModel,
+      instructions:
+        "Translate English text into natural Ukrainian for live video dubbing. Respond only with the Ukrainian translation, keep it concise, and finish the full phrase before stopping.",
+      output_modalities: ["audio"],
+      audio: {
+        output: {
+          voice: realtimeVoice,
+          speed: 1.08,
+        },
+      },
+    };
+  }
+
+  return {
+    type: "transcription",
+    audio: {
+      input: {
+        transcription: {
+          model: "gpt-4o-mini-transcribe",
+          language: "en",
+        },
+        turn_detection: {
+          type: "semantic_vad",
+          eagerness: "low",
+          create_response: false,
+          interrupt_response: false,
+        },
+      },
+    },
+  };
+}
+
+export async function POST(request: Request) {
+  if (!shouldBypassStaticAuth() && !isStaticAuthConfigured()) {
+    return NextResponse.json({ error: "Static auth is not configured." }, { status: 503 });
+  }
+
+  if (
+    !shouldBypassStaticAuth() &&
+    !(await isStaticAuthRequestAuthorized(request.headers.get("cookie")))
+  ) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
   const apiKey = process.env.OPENAI_API_KEY;
 
   if (!apiKey) {
@@ -15,6 +71,9 @@ export async function POST() {
       { status: 503 },
     );
   }
+
+  const body = (await request.json().catch(() => null)) as { mode?: string } | null;
+  const mode = body?.mode === "translation" ? "translation" : "transcription";
 
   const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
     method: "POST",
@@ -27,27 +86,7 @@ export async function POST() {
         anchor: "created_at",
         seconds: 60,
       },
-      session: {
-        type: "realtime",
-        model: realtimeModel,
-        instructions:
-          "Transcribe spoken English from the input audio accurately. Do not generate assistant replies.",
-        output_modalities: ["text"],
-        audio: {
-          input: {
-            transcription: {
-              model: "gpt-4o-mini-transcribe",
-              language: "en",
-            },
-            turn_detection: {
-              type: "semantic_vad",
-              eagerness: "low",
-              create_response: false,
-              interrupt_response: false,
-            },
-          },
-        },
-      },
+      session: getSessionConfig(mode),
     }),
   });
 

@@ -1,5 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { extractPTLiveDetails, parseSupportedUrl } from "@/lib/media";
+import {
+  isStaticAuthConfigured,
+  isStaticAuthRequestAuthorized,
+  shouldBypassStaticAuth,
+} from "@/lib/static-auth";
 
 const FORWARDED_HEADERS = [
   "accept-ranges",
@@ -15,6 +20,17 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export async function GET(request: NextRequest) {
+  if (!shouldBypassStaticAuth() && !isStaticAuthConfigured()) {
+    return NextResponse.json({ error: "Static auth is not configured." }, { status: 503 });
+  }
+
+  if (
+    !shouldBypassStaticAuth() &&
+    !(await isStaticAuthRequestAuthorized(request.headers.get("cookie")))
+  ) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
   const shareUrl = request.nextUrl.searchParams.get("shareUrl");
 
   if (!shareUrl) {
@@ -66,4 +82,3 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: message }, { status: 400 });
   }
 }
-

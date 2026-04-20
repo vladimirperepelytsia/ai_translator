@@ -1,3 +1,4 @@
+import { LogoutForm } from "@/components/logout-form";
 import { MediaPlayer } from "@/components/media-player";
 import {
   extractMediaDetails,
@@ -5,6 +6,7 @@ import {
   type MediaDetails,
   type SearchParamValue,
 } from "@/lib/media";
+import { shouldBypassStaticAuth } from "@/lib/static-auth";
 
 type PageProps = {
   searchParams: Promise<{
@@ -14,6 +16,7 @@ type PageProps = {
 
 export default async function Home({ searchParams }: PageProps) {
   const shareUrl = getSingleValue((await searchParams).url)?.trim() ?? "";
+  const showLogout = !shouldBypassStaticAuth();
 
   let media: MediaDetails | null = null;
   let error: string | null = null;
@@ -32,9 +35,17 @@ export default async function Home({ searchParams }: PageProps) {
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,#1f3b54_0%,#08111d_40%,#04070b_100%)] px-6 py-10 text-white">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-8">
-        <section className="overflow-hidden rounded-[2rem] border border-white/10 bg-white/6 shadow-2xl shadow-black/40 backdrop-blur">
+        <section className="relative overflow-hidden rounded-[2rem] border border-white/10 bg-white/6 shadow-2xl shadow-black/40 backdrop-blur">
+          {showLogout ? (
+            <div className="absolute top-6 right-6 z-10 lg:top-10 lg:right-10">
+              <LogoutForm />
+            </div>
+          ) : null}
+
           <div className="grid gap-0 lg:grid-cols-[minmax(0,1.2fr)_minmax(24rem,0.8fr)]">
-            <div className="border-b border-white/10 p-8 lg:border-r lg:border-b-0 lg:p-10">
+            <div
+              className={`border-b border-white/10 p-8 lg:border-r lg:border-b-0 lg:p-10 ${showLogout ? "pr-32 lg:pr-10" : ""}`}
+            >
               <p className="text-xs uppercase tracking-[0.35em] text-cyan-300/80">
                 Video Extractor
               </p>
@@ -55,7 +66,7 @@ export default async function Home({ searchParams }: PageProps) {
               </p>
             </div>
 
-            <div className="p-8 lg:p-10">
+            <div className={`p-8 lg:p-10 ${showLogout ? "pt-20 lg:pt-24" : ""}`}>
               <form action="" className="space-y-4">
                 <label className="block">
                   <span className="mb-2 block text-sm font-medium text-white/80">
@@ -79,13 +90,6 @@ export default async function Home({ searchParams }: PageProps) {
                   Extract video
                 </button>
               </form>
-
-              <div className="mt-6 rounded-2xl border border-white/10 bg-black/20 p-4 text-sm text-white/60">
-                PT Live links are fetched on the server to avoid CORS issues while reading the share
-                page HTML. PT Live playback can also stream browser audio into an OpenAI Realtime
-                session for English-to-Ukrainian voice translation. YouTube links are converted into
-                a privacy-enhanced embed URL.
-              </div>
             </div>
           </div>
         </section>

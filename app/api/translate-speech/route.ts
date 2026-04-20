@@ -1,4 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
+import {
+  isStaticAuthConfigured,
+  isStaticAuthRequestAuthorized,
+  shouldBypassStaticAuth,
+} from "@/lib/static-auth";
 
 const translationModel = process.env.OPENAI_TRANSLATION_MODEL ?? "gpt-4.1-mini";
 const fallbackTranslationModel = process.env.OPENAI_TRANSLATION_FALLBACK_MODEL ?? "gpt-4.1-mini";
@@ -106,6 +111,17 @@ async function requestTranslation(apiKey: string, model: string, sourceText: str
 }
 
 export async function POST(request: NextRequest) {
+  if (!shouldBypassStaticAuth() && !isStaticAuthConfigured()) {
+    return NextResponse.json({ error: "Static auth is not configured." }, { status: 503 });
+  }
+
+  if (
+    !shouldBypassStaticAuth() &&
+    !(await isStaticAuthRequestAuthorized(request.headers.get("cookie")))
+  ) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
   const apiKey = process.env.OPENAI_API_KEY;
 
   if (!apiKey) {

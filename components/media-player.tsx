@@ -10,18 +10,18 @@ import {
 
 type TranslationState = "idle" | "starting" | "live" | "error";
 
-type TranslatedClip = {
-  translatedText: string;
-  audioBase64: string;
-  mimeType: string;
+type TranscriptJob = {
+  sequence: number;
+  sourceTime: number;
+  text: string;
 };
 
-const translationSessionUpdate = {
+const MAX_ALLOWED_TRANSLATION_LAG_SECONDS = 4;
+
+const transcriptionSessionUpdate = {
   type: "session.update",
   session: {
-    instructions:
-      "Transcribe spoken English from the input audio accurately. Do not generate assistant replies.",
-    output_modalities: ["text"],
+    type: "transcription",
     audio: {
       input: {
         turn_detection: {
@@ -39,11 +39,15 @@ const translationSessionUpdate = {
   },
 } as const;
 
-function base64ToBlob(base64: string, mimeType: string) {
-  const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
-
-  return new Blob([bytes], { type: mimeType });
-}
+const translatorSessionUpdate = {
+  type: "session.update",
+  session: {
+    type: "realtime",
+    instructions:
+      "Translate each provided English phrase into natural Ukrainian for live video dubbing. Respond only with the Ukrainian translation, keep it concise, and finish the full phrase before stopping.",
+    output_modalities: ["audio"],
+  },
+} as const;
 
 function Detail({
   label,
@@ -67,17 +71,23 @@ function Detail({
 function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const translatedAudioRef = useRef<HTMLAudioElement>(null);
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const transcriptionPeerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const translationPeerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const transcriptionDataChannelRef = useRef<RTCDataChannel | null>(null);
+  const translationDataChannelRef = useRef<RTCDataChannel | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
   const originalGainRef = useRef<GainNode | null>(null);
   const captureDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
-  const translationQueueRef = useRef<string[]>([]);
-  const playbackQueueRef = useRef<TranslatedClip[]>([]);
-  const isTranslatingRef = useRef(false);
-  const currentPlaybackUrlRef = useRef<string | null>(null);
+  const translationQueueRef = useRef<TranscriptJob[]>([]);
+  const activeTranslationJobRef = useRef<TranscriptJob | null>(null);
+  const activeTranslationResponseIdRef = useRef<string | null>(null);
+  const activeTranslatedTextRef = useRef<string | null>(null);
   const sessionVersionRef = useRef(0);
+  const nextTranscriptSequenceRef = useRef(0);
+  const transcriptionConnectedRef = useRef(false);
+  const translationConnectedRef = useRef(false);
+  const translationOutputStartedRef = useRef(false);
   const [translationState, setTranslationState] = useState<TranslationState>("idle");
   const [statusMessage, setStatusMessage] = useState(
     "Ready to start Ukrainian voice translation.",
@@ -86,43 +96,57 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
   const [translatedHistory, setTranslatedHistory] = useState<string[]>([]);
   const [pendingTranslations, setPendingTranslations] = useState(0);
 
-  const clearPlaybackAudio = useCallback(() => {
-    if (translatedAudioRef.current) {
-      translatedAudioRef.current.pause();
-      translatedAudioRef.current.srcObject = null;
-      translatedAudioRef.current.removeAttribute("src");
-      translatedAudioRef.current.load();
-      translatedAudioRef.current.onended = null;
+  const updatePendingTranslations = useCallback(() => {
+    setPendingTranslations(
+      translationQueueRef.current.length + (activeTranslationJobRef.current ? 1 : 0),
+    );
+  }, []);
+
+  const setOriginalAudioMuted = useCallback((muted: boolean) => {
+    if (originalGainRef.current) {
+      originalGainRef.current.gain.value = muted ? 0 : 1;
+    }
+  }, []);
+
+  const resetTranslatedAudio = useCallback(() => {
+    if (!translatedAudioRef.current) {
+      return;
     }
 
-    if (currentPlaybackUrlRef.current) {
-      URL.revokeObjectURL(currentPlaybackUrlRef.current);
-      currentPlaybackUrlRef.current = null;
-    }
+    translatedAudioRef.current.pause();
+    translatedAudioRef.current.srcObject = null;
+    translatedAudioRef.current.removeAttribute("src");
+    translatedAudioRef.current.load();
   }, []);
 
   const stopTranslation = useCallback(() => {
     sessionVersionRef.current += 1;
 
-    dataChannelRef.current?.close();
-    dataChannelRef.current = null;
+    transcriptionDataChannelRef.current?.close();
+    transcriptionDataChannelRef.current = null;
+    translationDataChannelRef.current?.close();
+    translationDataChannelRef.current = null;
 
-    peerConnectionRef.current?.close();
-    peerConnectionRef.current = null;
+    transcriptionPeerConnectionRef.current?.close();
+    transcriptionPeerConnectionRef.current = null;
+    translationPeerConnectionRef.current?.close();
+    translationPeerConnectionRef.current = null;
 
-    clearPlaybackAudio();
-
-    if (originalGainRef.current) {
-      originalGainRef.current.gain.value = 1;
-    }
+    resetTranslatedAudio();
+    setOriginalAudioMuted(false);
 
     translationQueueRef.current = [];
-    playbackQueueRef.current = [];
-    isTranslatingRef.current = false;
+    activeTranslationJobRef.current = null;
+    activeTranslationResponseIdRef.current = null;
+    activeTranslatedTextRef.current = null;
+    nextTranscriptSequenceRef.current = 0;
+    transcriptionConnectedRef.current = false;
+    translationConnectedRef.current = false;
+    translationOutputStartedRef.current = false;
     setPendingTranslations(0);
     setTranslationState("idle");
     setStatusMessage("Translation stopped.");
-  }, [clearPlaybackAudio]);
+  }, [resetTranslatedAudio, setOriginalAudioMuted]);
 
   useEffect(() => {
     return () => {
@@ -172,100 +196,160 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
     return captureDestinationRef.current.stream;
   }
 
-  async function playNextClip() {
-    const translatedAudio = translatedAudioRef.current;
-    const nextClip = playbackQueueRef.current.shift();
+  function dropStaleQueuedPhrases() {
+    const currentVideoTime = videoRef.current?.currentTime;
 
-    if (!translatedAudio || !nextClip) {
-      if (translationState === "live") {
-        setStatusMessage("Listening for the next English phrase...");
-      }
+    if (typeof currentVideoTime !== "number") {
       return;
     }
 
-    clearPlaybackAudio();
+    let removedAny = false;
 
-    const clipUrl = URL.createObjectURL(base64ToBlob(nextClip.audioBase64, nextClip.mimeType));
-    currentPlaybackUrlRef.current = clipUrl;
-    translatedAudio.src = clipUrl;
-    translatedAudio.onended = () => {
-      void playNextClip();
-    };
+    while (
+      translationQueueRef.current.length > 0 &&
+      currentVideoTime - translationQueueRef.current[0].sourceTime >
+        MAX_ALLOWED_TRANSLATION_LAG_SECONDS
+    ) {
+      translationQueueRef.current.shift();
+      removedAny = true;
+    }
 
-    setTranslatedHistory((currentHistory) => [...currentHistory, nextClip.translatedText]);
-    setStatusMessage("Playing the full Ukrainian phrase...");
-
-    try {
-      await translatedAudio.play();
-    } catch {
-      setStatusMessage("Translated audio is ready. Press play if the browser kept audio muted.");
+    if (removedAny) {
+      updatePendingTranslations();
+      setStatusMessage("Skipping delayed phrases to stay close to the current video.");
     }
   }
 
-  async function processTranslationQueue(sessionVersion: number) {
-    if (isTranslatingRef.current) {
+  function markLiveIfReady() {
+    if (!transcriptionConnectedRef.current || !translationConnectedRef.current) {
       return;
     }
 
-    isTranslatingRef.current = true;
+    setTranslationState("live");
+    setStatusMessage(
+      activeTranslationJobRef.current
+        ? "Connected. Streaming Ukrainian audio for the current phrase."
+        : "Connected. Waiting for the next English phrase to stream into Ukrainian.",
+    );
+  }
 
-    while (translationQueueRef.current.length > 0 && sessionVersionRef.current === sessionVersion) {
-      const englishPhrase = translationQueueRef.current.shift();
+  function recordTranslatedPhrase(text: string) {
+    const normalizedText = text.trim();
 
-      if (!englishPhrase) {
-        continue;
-      }
-
-      setPendingTranslations(translationQueueRef.current.length);
-      setStatusMessage("Translating the next English phrase into Ukrainian...");
-
-      try {
-        const response = await fetch("/api/translate-speech", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            text: englishPhrase,
-          }),
-        });
-        const payload = (await response.json()) as {
-          error?: string;
-          translatedText?: string;
-          audioBase64?: string;
-          mimeType?: string;
-        };
-
-        if (!response.ok || !payload.audioBase64 || !payload.translatedText || !payload.mimeType) {
-          throw new Error(payload.error ?? "Could not translate and synthesize the phrase.");
-        }
-
-        if (sessionVersionRef.current !== sessionVersion) {
-          break;
-        }
-
-        playbackQueueRef.current.push({
-          translatedText: payload.translatedText,
-          audioBase64: payload.audioBase64,
-          mimeType: payload.mimeType,
-        });
-
-        if (translatedAudioRef.current?.paused ?? true) {
-          await playNextClip();
-        }
-      } catch (error) {
-        setTranslationState("error");
-        setStatusMessage(
-          error instanceof Error
-            ? error.message
-            : "Something went wrong while translating the phrase.",
-        );
-        break;
-      }
+    if (!normalizedText || activeTranslatedTextRef.current === normalizedText) {
+      return;
     }
 
-    isTranslatingRef.current = false;
-    setPendingTranslations(translationQueueRef.current.length);
+    activeTranslatedTextRef.current = normalizedText;
+    setTranslatedHistory((currentHistory) => [...currentHistory, normalizedText]);
+  }
+
+  async function submitNextTranslationJob(sessionVersion: number) {
+    if (sessionVersionRef.current !== sessionVersion || activeTranslationJobRef.current) {
+      return;
+    }
+
+    const translationChannel = translationDataChannelRef.current;
+
+    if (!translationChannel || translationChannel.readyState !== "open") {
+      return;
+    }
+
+    dropStaleQueuedPhrases();
+
+    const nextJob = translationQueueRef.current.shift();
+    updatePendingTranslations();
+
+    if (!nextJob) {
+      setOriginalAudioMuted(false);
+
+      if (translationState === "live") {
+        setStatusMessage("Connected. Waiting for the next English phrase to stream into Ukrainian.");
+      }
+
+      return;
+    }
+
+    activeTranslationJobRef.current = nextJob;
+    activeTranslationResponseIdRef.current = null;
+    activeTranslatedTextRef.current = null;
+    translationOutputStartedRef.current = false;
+    updatePendingTranslations();
+    setStatusMessage("Streaming Ukrainian translation for the next English phrase...");
+
+    translationChannel.send(
+      JSON.stringify({
+        type: "response.create",
+        response: {
+          conversation: "none",
+          output_modalities: ["audio"],
+          instructions:
+            "Translate the provided English phrase into natural Ukrainian for live dubbing. Respond only with the Ukrainian translation. Keep the wording compact, and finish the full phrase before stopping.",
+          metadata: {
+            sequence: String(nextJob.sequence),
+            source_time_seconds: nextJob.sourceTime.toFixed(2),
+          },
+          input: [
+            {
+              type: "message",
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: nextJob.text,
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    );
+  }
+
+  function finishActiveTranslationJob(sessionVersion: number, nextStatusMessage?: string) {
+    if (sessionVersionRef.current !== sessionVersion || !activeTranslationJobRef.current) {
+      return;
+    }
+
+    activeTranslationJobRef.current = null;
+    activeTranslationResponseIdRef.current = null;
+    activeTranslatedTextRef.current = null;
+    translationOutputStartedRef.current = false;
+    updatePendingTranslations();
+    dropStaleQueuedPhrases();
+
+    if (translationQueueRef.current.length > 0) {
+      void submitNextTranslationJob(sessionVersion);
+      return;
+    }
+
+    setOriginalAudioMuted(false);
+
+    if (translationState === "live") {
+      setStatusMessage(
+        nextStatusMessage ?? "Connected. Waiting for the next English phrase to stream into Ukrainian.",
+      );
+    }
+  }
+
+  async function requestRealtimeToken(mode: "transcription" | "translation") {
+    const response = await fetch("/api/realtime/client-secret", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ mode }),
+    });
+    const payload = (await response.json()) as {
+      error?: string;
+      value?: string;
+    };
+
+    if (!response.ok || !payload.value) {
+      throw new Error(payload.error ?? "Could not create an OpenAI Realtime session.");
+    }
+
+    return payload.value;
   }
 
   async function startTranslation() {
@@ -283,8 +367,15 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
       setTranslatedHistory([]);
       setPendingTranslations(0);
       translationQueueRef.current = [];
-      playbackQueueRef.current = [];
-      clearPlaybackAudio();
+      activeTranslationJobRef.current = null;
+      activeTranslationResponseIdRef.current = null;
+      activeTranslatedTextRef.current = null;
+      nextTranscriptSequenceRef.current = 0;
+      transcriptionConnectedRef.current = false;
+      translationConnectedRef.current = false;
+      translationOutputStartedRef.current = false;
+      setOriginalAudioMuted(false);
+      resetTranslatedAudio();
 
       const captureStream = await ensureAudioGraph();
       const audioTrack = captureStream.getAudioTracks()[0];
@@ -293,96 +384,267 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
         throw new Error("Could not capture the PT Live video audio track.");
       }
 
-      setStatusMessage("Requesting an OpenAI Realtime transcription session...");
-      const tokenResponse = await fetch("/api/realtime/client-secret", {
-        method: "POST",
-      });
-      const tokenPayload = (await tokenResponse.json()) as {
-        error?: string;
-        value?: string;
-      };
+      setStatusMessage("Requesting OpenAI Realtime sessions...");
+      const [transcriptionToken, translationToken] = await Promise.all([
+        requestRealtimeToken("transcription"),
+        requestRealtimeToken("translation"),
+      ]);
 
-      if (!tokenResponse.ok || !tokenPayload.value) {
-        throw new Error(tokenPayload.error ?? "Could not create an OpenAI Realtime session.");
-      }
+      const transcriptionPeerConnection = new RTCPeerConnection();
+      transcriptionPeerConnectionRef.current = transcriptionPeerConnection;
 
-      const peerConnection = new RTCPeerConnection();
-      peerConnectionRef.current = peerConnection;
-
-      peerConnection.onconnectionstatechange = () => {
-        const state = peerConnection.connectionState;
+      transcriptionPeerConnection.onconnectionstatechange = () => {
+        const state = transcriptionPeerConnection.connectionState;
 
         if (state === "connected") {
-          setTranslationState("live");
-          setStatusMessage("Listening to English audio and queuing full Ukrainian phrases.");
-          if (originalGainRef.current) {
-            originalGainRef.current.gain.value = 0;
-          }
+          transcriptionConnectedRef.current = true;
+          markLiveIfReady();
         } else if (state === "failed" || state === "disconnected" || state === "closed") {
+          transcriptionConnectedRef.current = false;
           stopTranslation();
         }
       };
 
-      const dataChannel = peerConnection.createDataChannel("oai-events");
-      dataChannelRef.current = dataChannel;
+      const transcriptionDataChannel = transcriptionPeerConnection.createDataChannel("oai-events");
+      transcriptionDataChannelRef.current = transcriptionDataChannel;
 
-      dataChannel.addEventListener("open", () => {
-        dataChannel.send(JSON.stringify(translationSessionUpdate));
+      transcriptionDataChannel.addEventListener("open", () => {
+        transcriptionDataChannel.send(JSON.stringify(transcriptionSessionUpdate));
       });
 
-      dataChannel.addEventListener("message", (event) => {
+      transcriptionDataChannel.addEventListener("message", (event) => {
         try {
           const payload = JSON.parse(event.data) as {
             type?: string;
             transcript?: string;
           };
-          const transcript = payload.transcript;
+          const transcript = payload.transcript?.trim();
 
           if (
             payload.type === "conversation.item.input_audio_transcription.completed" &&
-            typeof transcript === "string"
+            typeof transcript === "string" &&
+            transcript
           ) {
             setTranscriptHistory((currentHistory) => [...currentHistory, transcript]);
-            translationQueueRef.current.push(transcript);
-            setPendingTranslations(translationQueueRef.current.length);
-            void processTranslationQueue(currentSessionVersion);
+            translationQueueRef.current.push({
+              sequence: nextTranscriptSequenceRef.current,
+              sourceTime: videoRef.current?.currentTime ?? 0,
+              text: transcript,
+            });
+            nextTranscriptSequenceRef.current += 1;
+            updatePendingTranslations();
+            dropStaleQueuedPhrases();
+            void submitNextTranslationJob(currentSessionVersion);
           }
         } catch {
           // Ignore malformed realtime events.
         }
       });
 
-      peerConnection.addTrack(audioTrack, captureStream);
+      transcriptionPeerConnection.addTrack(audioTrack, captureStream);
 
-      const offer = await peerConnection.createOffer();
-      await peerConnection.setLocalDescription(offer);
+      const translationPeerConnection = new RTCPeerConnection();
+      translationPeerConnectionRef.current = translationPeerConnection;
+      translationPeerConnection.addTransceiver("audio", { direction: "recvonly" });
 
-      if (!offer.sdp) {
+      translationPeerConnection.ontrack = (event) => {
+        if (!translatedAudioRef.current) {
+          return;
+        }
+
+        translatedAudioRef.current.srcObject = event.streams[0];
+      };
+
+      translationPeerConnection.onconnectionstatechange = () => {
+        const state = translationPeerConnection.connectionState;
+
+        if (state === "connected") {
+          translationConnectedRef.current = true;
+          markLiveIfReady();
+        } else if (state === "failed" || state === "disconnected" || state === "closed") {
+          translationConnectedRef.current = false;
+          stopTranslation();
+        }
+      };
+
+      const translationDataChannel = translationPeerConnection.createDataChannel("oai-events");
+      translationDataChannelRef.current = translationDataChannel;
+
+      translationDataChannel.addEventListener("open", () => {
+        translationDataChannel.send(JSON.stringify(translatorSessionUpdate));
+        void submitNextTranslationJob(currentSessionVersion);
+      });
+
+      translationDataChannel.addEventListener("message", (event) => {
+        try {
+          const payload = JSON.parse(event.data) as {
+            type?: string;
+            text?: string;
+            response_id?: string;
+            response?: {
+              id?: string;
+              status?: string;
+            };
+            part?: {
+              type?: string;
+              text?: string;
+              transcript?: string;
+            };
+            error?: {
+              message?: string;
+            };
+          };
+
+          const activeResponseId = activeTranslationResponseIdRef.current;
+
+          if (payload.type === "error") {
+            throw new Error(payload.error?.message ?? "The realtime translation session failed.");
+          }
+
+          if (payload.type === "response.created" && payload.response?.id) {
+            activeTranslationResponseIdRef.current = payload.response.id;
+            return;
+          }
+
+          if (payload.type === "response.output_text.done" && typeof payload.text === "string") {
+            recordTranslatedPhrase(payload.text);
+            return;
+          }
+
+          if (
+            payload.type === "response.content_part.done" &&
+            payload.part?.type === "text" &&
+            typeof payload.part.text === "string"
+          ) {
+            recordTranslatedPhrase(payload.part.text);
+            return;
+          }
+
+          if (
+            payload.type === "response.content_part.done" &&
+            payload.part?.type === "audio" &&
+            typeof payload.part.transcript === "string"
+          ) {
+            recordTranslatedPhrase(payload.part.transcript);
+            return;
+          }
+
+          if (
+            payload.type === "output_audio_buffer.started" &&
+            (!activeResponseId || payload.response_id === activeResponseId)
+          ) {
+            translationOutputStartedRef.current = true;
+            setOriginalAudioMuted(true);
+            setStatusMessage("Streaming Ukrainian audio over the live translation channel...");
+            const playPromise = translatedAudioRef.current?.play();
+            if (playPromise) {
+              void playPromise.catch(() => {
+                setStatusMessage(
+                  "The translation stream is ready. Press play if the browser kept audio muted.",
+                );
+              });
+            }
+            return;
+          }
+
+          if (
+            payload.type === "output_audio_buffer.stopped" &&
+            (!activeResponseId || payload.response_id === activeResponseId)
+          ) {
+            finishActiveTranslationJob(
+              currentSessionVersion,
+              "Connected. Waiting for the next English phrase to stream into Ukrainian.",
+            );
+            return;
+          }
+
+          if (payload.type === "response.done") {
+            if (payload.response?.status === "failed" || payload.response?.status === "cancelled") {
+              finishActiveTranslationJob(
+                currentSessionVersion,
+                "The previous translation did not finish. Waiting for the next phrase.",
+              );
+            } else if (!translationOutputStartedRef.current) {
+              finishActiveTranslationJob(
+                currentSessionVersion,
+                "Connected. Waiting for the next English phrase to stream into Ukrainian.",
+              );
+            }
+          }
+        } catch (error) {
+          stopTranslation();
+          setTranslationState("error");
+          setStatusMessage(
+            error instanceof Error
+              ? error.message
+              : "Something went wrong while streaming translation.",
+          );
+        }
+      });
+
+      const [transcriptionOffer, translationOffer] = await Promise.all([
+        transcriptionPeerConnection.createOffer(),
+        translationPeerConnection.createOffer(),
+      ]);
+
+      await Promise.all([
+        transcriptionPeerConnection.setLocalDescription(transcriptionOffer),
+        translationPeerConnection.setLocalDescription(translationOffer),
+      ]);
+
+      if (!transcriptionOffer.sdp || !translationOffer.sdp) {
         throw new Error("Could not create a WebRTC offer for the translation session.");
       }
 
       setStatusMessage("Connecting the browser to OpenAI Realtime...");
-      const realtimeResponse = await fetch("https://api.openai.com/v1/realtime/calls", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${tokenPayload.value}`,
-          "Content-Type": "application/sdp",
-        },
-        body: offer.sdp,
-      });
+      const [transcriptionRealtimeResponse, translationRealtimeResponse] = await Promise.all([
+        fetch("https://api.openai.com/v1/realtime/calls", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${transcriptionToken}`,
+            "Content-Type": "application/sdp",
+          },
+          body: transcriptionOffer.sdp,
+        }),
+        fetch("https://api.openai.com/v1/realtime/calls", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${translationToken}`,
+            "Content-Type": "application/sdp",
+          },
+          body: translationOffer.sdp,
+        }),
+      ]);
 
-      if (!realtimeResponse.ok) {
-        throw new Error(`OpenAI Realtime connection failed (${realtimeResponse.status}).`);
+      if (!transcriptionRealtimeResponse.ok) {
+        throw new Error(
+          `OpenAI Realtime transcription connection failed (${transcriptionRealtimeResponse.status}).`,
+        );
       }
 
-      await peerConnection.setRemoteDescription({
-        type: "answer",
-        sdp: await realtimeResponse.text(),
-      });
+      if (!translationRealtimeResponse.ok) {
+        throw new Error(
+          `OpenAI Realtime translation connection failed (${translationRealtimeResponse.status}).`,
+        );
+      }
 
-      setStatusMessage(
-        "Connected. Start or resume the video. English phrases will be translated and spoken in order.",
-      );
+      const [transcriptionAnswer, translationAnswer] = await Promise.all([
+        transcriptionRealtimeResponse.text(),
+        translationRealtimeResponse.text(),
+      ]);
+
+      await Promise.all([
+        transcriptionPeerConnection.setRemoteDescription({
+          type: "answer",
+          sdp: transcriptionAnswer,
+        }),
+        translationPeerConnection.setRemoteDescription({
+          type: "answer",
+          sdp: translationAnswer,
+        }),
+      ]);
+
+      setStatusMessage("Connected. Waiting for the first English phrase to translate.");
     } catch (error) {
       stopTranslation();
       setTranslationState("error");
@@ -437,12 +699,13 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
         <div className="mt-4 rounded-2xl border border-white/10 bg-black/20 p-4 text-sm text-white/70">
           <p>{statusMessage}</p>
           <p className="mt-2 text-white/50">
-            While translation is active, the original English audio is muted. Each detected English
-            phrase is translated, synthesized, and played to completion in Ukrainian.
+            While translation is active, the video keeps playing. English phrases are transcribed on
+            one live channel and streamed back as Ukrainian speech on another. If the queue falls
+            behind, older unsent phrases are skipped to stay close to the video.
           </p>
           {pendingTranslations > 0 ? (
             <p className="mt-2 text-cyan-200/80">
-              Pending phrases in queue: {pendingTranslations}
+              Phrases waiting or streaming: {pendingTranslations}
             </p>
           ) : null}
         </div>
