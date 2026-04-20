@@ -4,6 +4,10 @@ import {
   isStaticAuthRequestAuthorized,
   shouldBypassStaticAuth,
 } from "@/lib/static-auth";
+import {
+  buildRealtimeTranslationSessionInstructions,
+  getTranslationLanguageConfig,
+} from "@/lib/translation-languages";
 
 const realtimeModel = process.env.OPENAI_REALTIME_MODEL ?? "gpt-realtime";
 const realtimeVoice =
@@ -13,13 +17,12 @@ export const runtime = "nodejs";
 
 type RealtimeMode = "transcription" | "translation";
 
-function getSessionConfig(mode: RealtimeMode) {
+function getSessionConfig(mode: RealtimeMode, targetLanguageLabel: string) {
   if (mode === "translation") {
     return {
       type: "realtime",
       model: realtimeModel,
-      instructions:
-        "Translate English text into natural Ukrainian for live video dubbing. Respond only with the Ukrainian translation, keep it concise, and finish the full phrase before stopping.",
+      instructions: buildRealtimeTranslationSessionInstructions(targetLanguageLabel),
       output_modalities: ["audio"],
       audio: {
         output: {
@@ -72,8 +75,12 @@ export async function POST(request: Request) {
     );
   }
 
-  const body = (await request.json().catch(() => null)) as { mode?: string } | null;
+  const body = (await request.json().catch(() => null)) as {
+    mode?: string;
+    targetLanguage?: string;
+  } | null;
   const mode = body?.mode === "translation" ? "translation" : "transcription";
+  const targetLanguage = getTranslationLanguageConfig(body?.targetLanguage);
 
   const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
     method: "POST",
@@ -86,7 +93,7 @@ export async function POST(request: Request) {
         anchor: "created_at",
         seconds: 60,
       },
-      session: getSessionConfig(mode),
+      session: getSessionConfig(mode, targetLanguage.label),
     }),
   });
 

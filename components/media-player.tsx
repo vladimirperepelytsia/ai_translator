@@ -7,6 +7,14 @@ import {
   type MediaDetails,
   type PTLiveVideoDetails,
 } from "@/lib/media";
+import {
+  buildRealtimeTranslationResponseInstructions,
+  buildRealtimeTranslationSessionInstructions,
+  DEFAULT_TRANSLATION_LANGUAGE,
+  getTranslationLanguageConfig,
+  TRANSLATION_LANGUAGE_OPTIONS,
+  type TranslationLanguage,
+} from "@/lib/translation-languages";
 
 type TranslationState = "idle" | "starting" | "live" | "error";
 
@@ -39,15 +47,32 @@ const transcriptionSessionUpdate = {
   },
 } as const;
 
-const translatorSessionUpdate = {
-  type: "session.update",
-  session: {
-    type: "realtime",
-    instructions:
-      "Translate each provided English phrase into natural Ukrainian for live video dubbing. Respond only with the Ukrainian translation, keep it concise, and finish the full phrase before stopping.",
-    output_modalities: ["audio"],
-  },
-} as const;
+function createTranslatorSessionUpdate(languageLabel: string) {
+  return {
+    type: "session.update",
+    session: {
+      type: "realtime",
+      instructions: buildRealtimeTranslationSessionInstructions(languageLabel),
+      output_modalities: ["audio"],
+    },
+  } as const;
+}
+
+function getReadyStatusMessage(languageLabel: string) {
+  return `Ready to start ${languageLabel} voice translation.`;
+}
+
+function getWaitingStatusMessage(languageLabel: string) {
+  return `Connected. Waiting for the next English phrase to stream into ${languageLabel}.`;
+}
+
+function getStreamingTranslationStatusMessage(languageLabel: string) {
+  return `Streaming ${languageLabel} translation for the next English phrase...`;
+}
+
+function getStreamingAudioStatusMessage(languageLabel: string) {
+  return `Streaming ${languageLabel} audio over the live translation channel...`;
+}
 
 function Detail({
   label,
@@ -88,9 +113,13 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
   const transcriptionConnectedRef = useRef(false);
   const translationConnectedRef = useRef(false);
   const translationOutputStartedRef = useRef(false);
+  const [translationLanguage, setTranslationLanguage] =
+    useState<TranslationLanguage>(DEFAULT_TRANSLATION_LANGUAGE);
+  const translationLanguageConfig = getTranslationLanguageConfig(translationLanguage);
+  const translationLanguageLabel = translationLanguageConfig.label;
   const [translationState, setTranslationState] = useState<TranslationState>("idle");
   const [statusMessage, setStatusMessage] = useState(
-    "Ready to start Ukrainian voice translation.",
+    getReadyStatusMessage(getTranslationLanguageConfig(DEFAULT_TRANSLATION_LANGUAGE).label),
   );
   const [transcriptHistory, setTranscriptHistory] = useState<string[]>([]);
   const [translatedHistory, setTranslatedHistory] = useState<string[]>([]);
@@ -228,8 +257,8 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
     setTranslationState("live");
     setStatusMessage(
       activeTranslationJobRef.current
-        ? "Connected. Streaming Ukrainian audio for the current phrase."
-        : "Connected. Waiting for the next English phrase to stream into Ukrainian.",
+        ? getStreamingAudioStatusMessage(translationLanguageLabel)
+        : getWaitingStatusMessage(translationLanguageLabel),
     );
   }
 
@@ -264,7 +293,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
       setOriginalAudioMuted(false);
 
       if (translationState === "live") {
-        setStatusMessage("Connected. Waiting for the next English phrase to stream into Ukrainian.");
+        setStatusMessage(getWaitingStatusMessage(translationLanguageLabel));
       }
 
       return;
@@ -275,7 +304,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
     activeTranslatedTextRef.current = null;
     translationOutputStartedRef.current = false;
     updatePendingTranslations();
-    setStatusMessage("Streaming Ukrainian translation for the next English phrase...");
+    setStatusMessage(getStreamingTranslationStatusMessage(translationLanguageLabel));
 
     translationChannel.send(
       JSON.stringify({
@@ -283,8 +312,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
         response: {
           conversation: "none",
           output_modalities: ["audio"],
-          instructions:
-            "Translate the provided English phrase into natural Ukrainian for live dubbing. Respond only with the Ukrainian translation. Keep the wording compact, and finish the full phrase before stopping.",
+          instructions: buildRealtimeTranslationResponseInstructions(translationLanguageLabel),
           metadata: {
             sequence: String(nextJob.sequence),
             source_time_seconds: nextJob.sourceTime.toFixed(2),
@@ -326,9 +354,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
     setOriginalAudioMuted(false);
 
     if (translationState === "live") {
-      setStatusMessage(
-        nextStatusMessage ?? "Connected. Waiting for the next English phrase to stream into Ukrainian.",
-      );
+      setStatusMessage(nextStatusMessage ?? getWaitingStatusMessage(translationLanguageLabel));
     }
   }
 
@@ -338,7 +364,9 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify(
+        mode === "translation" ? { mode, targetLanguage: translationLanguage } : { mode },
+      ),
     });
     const payload = (await response.json()) as {
       error?: string;
@@ -471,7 +499,9 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
       translationDataChannelRef.current = translationDataChannel;
 
       translationDataChannel.addEventListener("open", () => {
-        translationDataChannel.send(JSON.stringify(translatorSessionUpdate));
+        translationDataChannel.send(
+          JSON.stringify(createTranslatorSessionUpdate(translationLanguageLabel)),
+        );
         void submitNextTranslationJob(currentSessionVersion);
       });
 
@@ -535,7 +565,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
           ) {
             translationOutputStartedRef.current = true;
             setOriginalAudioMuted(true);
-            setStatusMessage("Streaming Ukrainian audio over the live translation channel...");
+            setStatusMessage(getStreamingAudioStatusMessage(translationLanguageLabel));
             const playPromise = translatedAudioRef.current?.play();
             if (playPromise) {
               void playPromise.catch(() => {
@@ -553,7 +583,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
           ) {
             finishActiveTranslationJob(
               currentSessionVersion,
-              "Connected. Waiting for the next English phrase to stream into Ukrainian.",
+              getWaitingStatusMessage(translationLanguageLabel),
             );
             return;
           }
@@ -567,7 +597,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
             } else if (!translationOutputStartedRef.current) {
               finishActiveTranslationJob(
                 currentSessionVersion,
-                "Connected. Waiting for the next English phrase to stream into Ukrainian.",
+                getWaitingStatusMessage(translationLanguageLabel),
               );
             }
           }
@@ -672,7 +702,44 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
       </div>
 
       <div className="border-t border-white/10 px-6 py-6 sm:px-8">
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="min-w-[13rem]">
+            <span className="mb-2 block text-sm font-medium text-white/80">
+              Translation language
+            </span>
+            <div className="relative">
+              <select
+                value={translationLanguage}
+                onChange={(event) => {
+                  const nextLanguage = getTranslationLanguageConfig(event.target.value);
+
+                  setTranslationLanguage(nextLanguage.code);
+                  setTranslatedHistory([]);
+                  setTranslationState("idle");
+                  setStatusMessage(getReadyStatusMessage(nextLanguage.label));
+                }}
+                disabled={translationState === "starting" || translationState === "live"}
+                className="w-full appearance-none rounded-2xl border border-white/15 bg-black/20 px-4 py-3 pr-12 text-sm text-white outline-none ring-0 focus:border-cyan-300/60 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {TRANSLATION_LANGUAGE_OPTIONS.map((language) => (
+                  <option
+                    key={language.value}
+                    value={language.value}
+                    className="bg-slate-950 text-white"
+                  >
+                    {language.label}
+                  </option>
+                ))}
+              </select>
+
+              <div className="pointer-events-none absolute inset-y-0 right-4 flex items-center text-white/50">
+                <svg aria-hidden="true" viewBox="0 0 12 8" className="h-3 w-3 fill-current">
+                  <path d="M1.41.59 6 5.17 10.59.59 12 2l-6 6-6-6z" />
+                </svg>
+              </div>
+            </div>
+          </label>
+
           <button
             type="button"
             onClick={startTranslation}
@@ -683,7 +750,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
               ? "Connecting..."
               : translationState === "live"
                 ? "Translation Live"
-                : "Start Ukrainian Translation"}
+                : `Start ${translationLanguageLabel} Translation`}
           </button>
 
           <button
@@ -700,8 +767,8 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
           <p>{statusMessage}</p>
           <p className="mt-2 text-white/50">
             While translation is active, the video keeps playing. English phrases are transcribed on
-            one live channel and streamed back as Ukrainian speech on another. If the queue falls
-            behind, older unsent phrases are skipped to stay close to the video.
+            one live channel and streamed back as {translationLanguageLabel} speech on another. If
+            the queue falls behind, older unsent phrases are skipped to stay close to the video.
           </p>
           {pendingTranslations > 0 ? (
             <p className="mt-2 text-cyan-200/80">
@@ -731,7 +798,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
         {translatedHistory.length > 0 ? (
           <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4">
             <p className="text-xs uppercase tracking-[0.2em] text-emerald-300/80">
-              Spoken Ukrainian Translation
+              Spoken {translationLanguageLabel} Translation
             </p>
             <div className="mt-3 max-h-64 space-y-3 overflow-y-auto pr-2">
               {translatedHistory.map((phrase, index) => (
@@ -747,7 +814,7 @@ function PTLiveTranslationControls({ media }: { media: PTLiveVideoDetails }) {
         ) : null}
 
         <p className="mt-4 text-xs uppercase tracking-[0.18em] text-white/35">
-          Disclosure: the Ukrainian translation voice is AI-generated.
+          Disclosure: the {translationLanguageLabel.toLowerCase()} translation voice is AI-generated.
         </p>
       </div>
     </>

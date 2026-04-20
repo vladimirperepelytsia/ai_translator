@@ -4,6 +4,11 @@ import {
   isStaticAuthRequestAuthorized,
   shouldBypassStaticAuth,
 } from "@/lib/static-auth";
+import {
+  buildSpeechInstructions,
+  buildTextTranslationInstructions,
+  getTranslationLanguageConfig,
+} from "@/lib/translation-languages";
 
 const translationModel = process.env.OPENAI_TRANSLATION_MODEL ?? "gpt-4.1-mini";
 const fallbackTranslationModel = process.env.OPENAI_TRANSLATION_FALLBACK_MODEL ?? "gpt-4.1-mini";
@@ -60,7 +65,12 @@ function summarizeOutput(payload: TranslationPayload) {
   }));
 }
 
-async function requestTranslation(apiKey: string, model: string, sourceText: string) {
+async function requestTranslation(
+  apiKey: string,
+  model: string,
+  sourceText: string,
+  targetLanguageLabel: string,
+) {
   const requestBody: Record<string, unknown> = {
     model,
     input: [
@@ -69,8 +79,7 @@ async function requestTranslation(apiKey: string, model: string, sourceText: str
         content: [
           {
             type: "input_text",
-            text:
-              "Translate the user's English video transcript into natural Ukrainian for voice dubbing. Return only the Ukrainian translation text, with no commentary, no quotes, and no source-language text.",
+            text: buildTextTranslationInstructions(targetLanguageLabel),
           },
         ],
       },
@@ -133,14 +142,23 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const body = (await request.json().catch(() => null)) as { text?: string } | null;
+  const body = (await request.json().catch(() => null)) as {
+    text?: string;
+    targetLanguage?: string;
+  } | null;
   const sourceText = body?.text?.trim();
+  const targetLanguage = getTranslationLanguageConfig(body?.targetLanguage);
 
   if (!sourceText) {
     return NextResponse.json({ error: "Missing source text." }, { status: 400 });
   }
 
-  const primaryAttempt = await requestTranslation(apiKey, translationModel, sourceText);
+  const primaryAttempt = await requestTranslation(
+    apiKey,
+    translationModel,
+    sourceText,
+    targetLanguage.label,
+  );
 
   if (!primaryAttempt.response.ok) {
     return NextResponse.json(
@@ -158,7 +176,12 @@ export async function POST(request: NextRequest) {
   };
 
   if (!translatedText && fallbackTranslationModel !== translationModel) {
-    const fallbackAttempt = await requestTranslation(apiKey, fallbackTranslationModel, sourceText);
+    const fallbackAttempt = await requestTranslation(
+      apiKey,
+      fallbackTranslationModel,
+      sourceText,
+      targetLanguage.label,
+    );
 
     if (fallbackAttempt.response.ok) {
       translatedText = fallbackAttempt.translatedText;
@@ -193,8 +216,7 @@ export async function POST(request: NextRequest) {
       voice: ttsVoice,
       input: translatedText,
       response_format: "mp3",
-      instructions:
-        "Speak in clear, natural Ukrainian. Finish the entire phrase completely, without truncating the ending.",
+      instructions: buildSpeechInstructions(targetLanguage.label),
     }),
   });
 

@@ -50,7 +50,7 @@ export default async function Home({ searchParams }: PageProps) {
                 Video Extractor
               </p>
               <h1 className="mt-4 max-w-2xl text-4xl font-semibold tracking-tight text-white sm:text-5xl">
-                Paste a PT Live or YouTube link and play it with optional Ukrainian live dubbing.
+                Paste a PT Live or YouTube link and play it with optional live dubbing.
               </h1>
               <p className="mt-4 max-w-2xl text-base leading-7 text-white/70">
                 Submit a PT Live shared recording URL to extract its MP4 source, or paste a YouTube
