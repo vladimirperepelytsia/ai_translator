@@ -19,6 +19,8 @@
 
 # production
 /build
+/public/pinch-dubbing-poc-output/
+/public/gemini-performance-script-dubbing-poc-output/
 
 # misc
 .DS_Store

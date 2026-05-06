@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { LogoutForm } from "@/components/logout-form";
 import { MediaPlayer } from "@/components/media-player";
 import {
@@ -90,6 +91,19 @@ export default async function Home({ searchParams }: PageProps) {
                   Extract video
                 </button>
               </form>
+
+              <Link
+                href="/pinch-dubbing-poc"
+                className="mt-3 inline-flex rounded-2xl border border-white/15 px-5 py-3 text-sm font-semibold text-white/85 transition hover:border-cyan-300/50 hover:text-white"
+              >
+                Open Pinch audio-to-audio POC
+              </Link>
+              <Link
+                href="/gemini-performance-script-dubbing-poc"
+                className="mt-3 inline-flex rounded-2xl border border-white/15 px-5 py-3 text-sm font-semibold text-white/85 transition hover:border-cyan-300/50 hover:text-white"
+              >
+                Open Gemini performance-script POC
+              </Link>
             </div>
           </div>
         </section>
