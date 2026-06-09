@@ -27,6 +27,15 @@ type PocResponse = {
   audioUrl?: string;
   provider?: string;
   targetLanguage?: string;
+  durationAlignment?: {
+    enabled: boolean;
+    mode?: string;
+    originalDurationSeconds?: number;
+    rawOutputDurationSeconds?: number;
+    finalOutputDurationSeconds?: number;
+    speedRatio?: number;
+    segmentCount?: number;
+  };
   models?: {
     script?: string;
     tts?: string;
@@ -145,7 +154,8 @@ export function GeminiPerformanceScriptDubbingPocForm() {
 
         <p className="text-sm leading-6 text-white/55">
           This POC asks Gemini to understand the source audio directly, generate an emotional
-          translated performance script, then render one natural Gemini TTS performance.
+          translated performance script with timed reply slots, then render each reply into its
+          matching original slot.
         </p>
 
         {error ? (
@@ -179,6 +189,13 @@ export function GeminiPerformanceScriptDubbingPocForm() {
             <p className="mt-3 text-sm leading-6 text-white/75">
               Original: {formatDuration(originalDuration)} · Output: {formatDuration(outputDuration)}
             </p>
+            {result?.durationAlignment ? (
+              <p className="mt-2 text-xs leading-5 text-white/50">
+                Server fit: {result.durationAlignment.mode ?? "unknown"} · final{" "}
+                {formatDuration(result.durationAlignment.finalOutputDurationSeconds ?? null)} ·
+                segments {result.durationAlignment.segmentCount ?? "n/a"}
+              </p>
+            ) : null}
           </div>
 
           {result ? (

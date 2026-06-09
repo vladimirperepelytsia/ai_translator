@@ -71,6 +71,7 @@ export async function POST(request: Request) {
       outputPath,
       outputUrl,
       segments: result.segments.length,
+      durationAlignment: result.durationAlignment,
     });
 
     return NextResponse.json({
@@ -82,6 +83,7 @@ export async function POST(request: Request) {
       mimeType: result.mimeType,
       provider: result.provider,
       targetLanguage: result.targetLanguage,
+      durationAlignment: result.durationAlignment,
       models: result.models,
       notice: result.notice,
     });
